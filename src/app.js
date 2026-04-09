@@ -1,5 +1,6 @@
 const express = require("express");
 const authRoutes = require("./routes/auth");
+const paymentRoutes = require("./routes/payments");
 const testimonialRoutes = require("./routes/testimonials");
 
 const app = express();
@@ -17,6 +18,7 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 app.get("/", (_req, res) => {
   res.status(200).json({
@@ -25,6 +27,7 @@ app.get("/", (_req, res) => {
 });
 
 app.use("/api/auth", authRoutes);
+app.use("/api/payments", paymentRoutes);
 app.use("/api/testimonials", testimonialRoutes);
 
 app.use((err, _req, res, _next) => {

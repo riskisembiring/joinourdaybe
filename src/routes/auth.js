@@ -2,18 +2,31 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const {
   collection,
+  doc,
+  getDoc,
   query,
   where,
   limit,
   getDocs,
-  doc,
+  orderBy,
   setDoc,
   serverTimestamp,
 } = require("firebase/firestore");
 const { db } = require("../config/firebase");
+const { isAdminUser } = require("../middleware/auth");
 
 const router = express.Router();
 const usersCollection = collection(db, "users");
+
+function sanitizeUser(user) {
+  return {
+    id: user.id,
+    nama: user.nama || null,
+    email: user.email || null,
+    role: user.role || "user",
+    createdAt: user.createdAt || null,
+  };
+}
 
 router.post("/register", async (req, res) => {
   try {
@@ -43,10 +56,12 @@ router.post("/register", async (req, res) => {
     }
 
     const userRef = doc(usersCollection);
+    const role = isAdminUser({ email: normalizedEmail }) ? "admin" : "user";
     const userData = {
       id: userRef.id,
       nama: nama.trim(),
       email: normalizedEmail,
+      role,
       passwordHash: await bcrypt.hash(password, 10),
       createdAt: serverTimestamp(),
     };
@@ -56,11 +71,7 @@ router.post("/register", async (req, res) => {
     return res.status(201).json({
       message: "Register successful.",
       data: {
-        user: {
-          id: userData.id,
-          nama: userData.nama,
-          email: userData.email,
-        },
+        user: sanitizeUser(userData),
       },
     });
   } catch (error) {
@@ -101,19 +112,57 @@ router.post("/login", async (req, res) => {
       });
     }
 
+    const role = user.role || (isAdminUser({ email: user.email }) ? "admin" : "user");
+
     return res.status(200).json({
       message: "Login successful.",
       data: {
-        user: {
-          id: user.id,
-          nama: user.nama,
-          email: user.email,
-        },
+        user: sanitizeUser({ ...user, role }),
       },
     });
   } catch (error) {
     return res.status(500).json({
       message: "Failed to login.",
+      error: error.message,
+    });
+  }
+});
+
+router.get("/admin/users", async (req, res) => {
+  try {
+    const userSnapshot = await getDocs(query(usersCollection, orderBy("createdAt", "desc")));
+    const users = userSnapshot.docs.map((snapshot) => sanitizeUser(snapshot.data()));
+
+    return res.status(200).json({
+      message: "User data fetched successfully.",
+      data: users,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch user data.",
+      error: error.message,
+    });
+  }
+});
+
+router.get("/admin/users/:userId", async (req, res) => {
+  try {
+    const userRef = doc(usersCollection, req.params.userId);
+    const userSnapshot = await getDoc(userRef);
+
+    if (!userSnapshot.exists()) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    return res.status(200).json({
+      message: "User detail fetched successfully.",
+      data: sanitizeUser(userSnapshot.data()),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch user detail.",
       error: error.message,
     });
   }
