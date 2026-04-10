@@ -12,6 +12,21 @@ function verifyAccessToken(token) {
   return jwt.verify(token, process.env.JWT_SECRET);
 }
 
+function createAccessToken(user = {}) {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email || null,
+      nama: user.nama || null,
+      role: user.role || "user",
+    },
+    process.env.JWT_SECRET,
+    {
+      expiresIn: process.env.JWT_EXPIRES_IN || "7d",
+    }
+  );
+}
+
 function getAdminEmails() {
   return (process.env.ADMIN_EMAILS || "")
     .split(",")
@@ -81,6 +96,7 @@ function requireAdmin(req, res, next) {
 
 module.exports = {
   attachAuthUser,
+  createAccessToken,
   getAdminEmails,
   isAdminUser,
   requireAdmin,

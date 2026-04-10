@@ -13,7 +13,7 @@ const {
   serverTimestamp,
 } = require("firebase/firestore");
 const { db } = require("../config/firebase");
-const { isAdminUser } = require("../middleware/auth");
+const { createAccessToken, isAdminUser, requireAdmin, requireAuth } = require("../middleware/auth");
 
 const router = express.Router();
 const usersCollection = collection(db, "users");
@@ -25,6 +25,15 @@ function sanitizeUser(user) {
     email: user.email || null,
     role: user.role || "user",
     createdAt: user.createdAt || null,
+  };
+}
+
+function buildAuthResponse(user) {
+  const sanitizedUser = sanitizeUser(user);
+
+  return {
+    user: sanitizedUser,
+    token: createAccessToken(sanitizedUser),
   };
 }
 
@@ -71,7 +80,7 @@ router.post("/register", async (req, res) => {
     return res.status(201).json({
       message: "Register successful.",
       data: {
-        user: sanitizeUser(userData),
+        ...buildAuthResponse(userData),
       },
     });
   } catch (error) {
@@ -117,7 +126,7 @@ router.post("/login", async (req, res) => {
     return res.status(200).json({
       message: "Login successful.",
       data: {
-        user: sanitizeUser({ ...user, role }),
+        ...buildAuthResponse({ ...user, role }),
       },
     });
   } catch (error) {
@@ -128,7 +137,7 @@ router.post("/login", async (req, res) => {
   }
 });
 
-router.get("/admin/users", async (req, res) => {
+router.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   try {
     const userSnapshot = await getDocs(query(usersCollection, orderBy("createdAt", "desc")));
     const users = userSnapshot.docs.map((snapshot) => sanitizeUser(snapshot.data()));
@@ -145,7 +154,7 @@ router.get("/admin/users", async (req, res) => {
   }
 });
 
-router.get("/admin/users/:userId", async (req, res) => {
+router.get("/admin/users/:userId", requireAuth, requireAdmin, async (req, res) => {
   try {
     const userRef = doc(usersCollection, req.params.userId);
     const userSnapshot = await getDoc(userRef);

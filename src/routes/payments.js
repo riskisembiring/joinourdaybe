@@ -13,7 +13,11 @@ const {
   where,
 } = require("firebase/firestore");
 const { db } = require("../config/firebase");
-const { midtransConfig, getMissingMidtransEnvVars } = require("../config/midtrans");
+const {
+  midtransConfig,
+  getMissingMidtransEnvVars,
+  getMidtransDiagnostics,
+} = require("../config/midtrans");
 
 const router = express.Router();
 const paymentsCollection = collection(db, "payments");
@@ -117,6 +121,13 @@ function sortPaymentsByNewest(payments) {
   );
 }
 
+function createMidtransContext(overrides = {}) {
+  return {
+    ...getMidtransDiagnostics(),
+    ...overrides,
+  };
+}
+
 function sendMidtransRequest(urlString, method = "GET", payload) {
   const url = new URL(urlString);
   const authorization = Buffer.from(`${midtransConfig.serverKey}:`).toString("base64");
@@ -153,9 +164,14 @@ function sendMidtransRequest(urlString, method = "GET", payload) {
             return resolve(parsedBody);
           }
 
-          return reject(
-            new Error(parsedBody.error_messages?.join(", ") || parsedBody.status_message || "Midtrans request failed.")
+          const error = new Error(
+            parsedBody.error_messages?.join(", ") || parsedBody.status_message || "Midtrans request failed."
           );
+          error.statusCode = response.statusCode;
+          error.responseBody = parsedBody;
+          error.url = urlString;
+
+          return reject(error);
         });
       }
     );
@@ -209,6 +225,10 @@ router.post("/midtrans/token", async (req, res) => {
       orderId?.trim() || `ORDER-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 
     const grossAmount = Number(amount);
+    const diagnostics = createMidtransContext({
+      orderId: normalizedOrderId,
+      amount: grossAmount,
+    });
     const paymentOwner = {
       userId: metadata.userId || null,
       userEmail: customerDetails.email || metadata.email || null,
@@ -247,6 +267,12 @@ router.post("/midtrans/token", async (req, res) => {
       snapPayload
     );
 
+    console.info("[midtrans] snap token created", {
+      ...diagnostics,
+      hasToken: Boolean(midtransResponse.token),
+      redirectHost: midtransResponse.redirect_url ? new URL(midtransResponse.redirect_url).hostname : null,
+    });
+
     await setDoc(doc(paymentsCollection, normalizedOrderId), {
       id: normalizedOrderId,
       orderId: normalizedOrderId,
@@ -276,12 +302,27 @@ router.post("/midtrans/token", async (req, res) => {
         redirectUrl: midtransResponse.redirect_url,
         clientKey: midtransConfig.clientKey,
         isProduction: midtransConfig.isProduction,
+        environment: midtransConfig.environment,
+        diagnostics,
       },
     });
   } catch (error) {
+    console.error("[midtrans] failed to create snap token", createMidtransContext({
+      orderId: req.body?.orderId || null,
+      amount: req.body?.amount ? Number(req.body.amount) : null,
+      statusCode: error.statusCode || null,
+      midtransMessage: error.message,
+      midtransResponse: error.responseBody || null,
+      url: error.url || midtransConfig.snapBaseUrl,
+    }));
+
     return res.status(500).json({
       message: "Failed to create Midtrans transaction.",
       error: error.message,
+      diagnostics: createMidtransContext({
+        orderId: req.body?.orderId || null,
+        url: error.url || midtransConfig.snapBaseUrl,
+      }),
     });
   }
 });
@@ -384,9 +425,7 @@ router.get("/midtrans/status/:orderId", async (req, res) => {
       });
     }
 
-    const midtransStatusUrl = midtransConfig.isProduction
-      ? `https://api.midtrans.com/v2/${orderId}/status`
-      : `https://api.sandbox.midtrans.com/v2/${orderId}/status`;
+    const midtransStatusUrl = `${midtransConfig.apiBaseUrl}/v2/${orderId}/status`;
 
     const statusResponse = await sendMidtransRequest(midtransStatusUrl, "GET");
     const paymentRef = doc(paymentsCollection, orderId);
@@ -413,12 +452,64 @@ router.get("/midtrans/status/:orderId", async (req, res) => {
 
     return res.status(200).json({
       message: "Midtrans status fetched successfully.",
-      data: statusResponse,
+      data: {
+        ...statusResponse,
+        diagnostics: createMidtransContext({ orderId }),
+      },
     });
   } catch (error) {
+    console.error("[midtrans] failed to fetch status", createMidtransContext({
+      orderId: req.params?.orderId || null,
+      statusCode: error.statusCode || null,
+      midtransMessage: error.message,
+      midtransResponse: error.responseBody || null,
+      url: error.url || null,
+    }));
+
     return res.status(500).json({
       message: "Failed to fetch Midtrans status.",
       error: error.message,
+      diagnostics: createMidtransContext({
+        orderId: req.params?.orderId || null,
+        url: error.url || null,
+      }),
+    });
+  }
+});
+
+router.get("/midtrans/local/:orderId", async (req, res) => {
+  try {
+    const { orderId } = req.params;
+
+    if (!orderId) {
+      return res.status(400).json({
+        message: "orderId is required.",
+      });
+    }
+
+    const paymentSnapshot = await getDoc(doc(paymentsCollection, orderId));
+
+    if (!paymentSnapshot.exists()) {
+      return res.status(404).json({
+        message: "Payment not found in local store.",
+        diagnostics: createMidtransContext({ orderId }),
+      });
+    }
+
+    return res.status(200).json({
+      message: "Local payment fetched successfully.",
+      data: {
+        ...serializePayment(paymentSnapshot.data()),
+        diagnostics: createMidtransContext({ orderId }),
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch local payment.",
+      error: error.message,
+      diagnostics: createMidtransContext({
+        orderId: req.params?.orderId || null,
+      }),
     });
   }
 });
