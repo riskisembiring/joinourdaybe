@@ -1,9 +1,9 @@
 const https = require("https");
 
-function getAdminWhatsAppNumbers() {
-  return (process.env.ADMIN_WHATSAPP_NUMBERS || "")
+function getAdminEmails() {
+  return (process.env.ADMIN_EMAILS || "")
     .split(",")
-    .map((phone) => phone.trim())
+    .map((email) => email.trim().toLowerCase())
     .filter(Boolean);
 }
 
@@ -39,10 +39,10 @@ function sendJsonRequest(urlString, method, headers, payload) {
 
           return reject(
             new Error(
-              parsedBody.reason ||
-                parsedBody.message ||
+              parsedBody.message ||
+                parsedBody.error?.message ||
                 parsedBody.error ||
-                `WhatsApp provider request failed with status ${response.statusCode}.`
+                `Email provider request failed with status ${response.statusCode}.`
             )
           );
         });
@@ -55,55 +55,59 @@ function sendJsonRequest(urlString, method, headers, payload) {
   });
 }
 
-async function sendViaFonnte({ target, message }) {
-  const apiKey = process.env.FONNTE_API_KEY;
+async function sendViaResend({ to, subject, text }) {
+  const apiKey = process.env.RESEND_API_KEY;
+  const from = process.env.EMAIL_FROM;
 
-  if (!apiKey) {
-    throw new Error("FONNTE_API_KEY is required for WhatsApp notifications.");
+  if (!apiKey || !from) {
+    throw new Error("RESEND_API_KEY and EMAIL_FROM are required for email notifications.");
   }
 
   return sendJsonRequest(
-    "https://api.fonnte.com/send",
+    "https://api.resend.com/emails",
     "POST",
     {
-      Authorization: apiKey,
+      Authorization: `Bearer ${apiKey}`,
     },
     {
-      target,
-      message,
+      from,
+      to,
+      subject,
+      text,
     }
   );
 }
 
-async function sendAdminWhatsApp({ message }) {
-  const targets = getAdminWhatsAppNumbers();
+async function sendAdminEmail({ subject, text }) {
+  const adminEmails = getAdminEmails();
 
-  if (targets.length === 0) {
+  if (adminEmails.length === 0) {
     return {
       skipped: true,
-      reason: "ADMIN_WHATSAPP_NUMBERS is empty.",
+      reason: "ADMIN_EMAILS is empty.",
     };
   }
 
-  const provider = (process.env.WHATSAPP_NOTIFICATION_PROVIDER || "fonnte").trim().toLowerCase();
+  const provider = (process.env.EMAIL_NOTIFICATION_PROVIDER || "resend").trim().toLowerCase();
 
-  if (provider === "fonnte") {
-    await sendViaFonnte({
-      target: targets.join(","),
-      message,
+  if (provider === "resend") {
+    await sendViaResend({
+      to: adminEmails,
+      subject,
+      text,
     });
 
     return {
       skipped: false,
       provider,
-      recipients: targets,
+      recipients: adminEmails,
     };
   }
 
-  throw new Error(`Unsupported WhatsApp provider: ${provider}`);
+  throw new Error(`Unsupported email provider: ${provider}`);
 }
 
 module.exports = {
-  getAdminWhatsAppNumbers,
-  sendAdminWhatsApp,
+  getAdminEmails,
+  sendAdminEmail,
 };

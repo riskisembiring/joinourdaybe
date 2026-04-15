@@ -18,7 +18,7 @@ const {
   getMissingMidtransEnvVars,
   getMidtransDiagnostics,
 } = require("../config/midtrans");
-const { sendAdminSettlementWhatsApp } = require("../services/whatsapp");
+const { notifyAdminOnSettlement } = require("../services/adminNotifications");
 
 const router = express.Router();
 const paymentsCollection = collection(db, "payments");
@@ -161,40 +161,6 @@ function buildMidtransPaymentUpdate({
   };
 }
 
-function formatCurrency(amount) {
-  if (typeof amount !== "number" || Number.isNaN(amount)) {
-    return null;
-  }
-
-  return new Intl.NumberFormat("id-ID", {
-    style: "currency",
-    currency: "IDR",
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
-
-function buildAdminSettlementMessage(payment = {}, notificationPayload = {}) {
-  const serializedPayment = serializePayment(payment);
-  const grossAmount = Number(notificationPayload.gross_amount || serializedPayment.amount || 0);
-  const paidAt =
-    notificationPayload.settlement_time ||
-    notificationPayload.transaction_time ||
-    serializedPayment.pembeli?.waktu ||
-    "-";
-
-  return [
-    "Pembayaran berhasil diterima.",
-    `Order ID: ${serializedPayment.orderId || "-"}`,
-    `Nama: ${serializedPayment.pembeli?.nama || "-"}`,
-    `Email: ${serializedPayment.email || "-"}`,
-    `Paket: ${serializedPayment.pembeli?.paket || "-"}`,
-    `Jumlah: ${formatCurrency(grossAmount) || "-"}`,
-    `Status: ${serializedPayment.status || notificationPayload.transaction_status || "-"}`,
-    `Metode: ${serializedPayment.paymentType || notificationPayload.payment_type || "-"}`,
-    `Waktu settlement: ${paidAt}`,
-  ].join("\n");
-}
-
 async function upsertPaymentStatus(orderId, paymentData) {
   const paymentRef = doc(paymentsCollection, orderId);
   const paymentSnapshot = await getDoc(paymentRef);
@@ -211,7 +177,11 @@ async function upsertPaymentStatus(orderId, paymentData) {
   });
 }
 
-async function notifyAdminWhenSettlement(orderId, notificationPayload) {
+async function processSettlementAdminNotifications(orderId, paymentData) {
+  if (paymentData.status !== "settlement") {
+    return;
+  }
+
   const paymentRef = doc(paymentsCollection, orderId);
   const paymentSnapshot = await getDoc(paymentRef);
 
@@ -220,56 +190,23 @@ async function notifyAdminWhenSettlement(orderId, notificationPayload) {
   }
 
   const payment = paymentSnapshot.data();
+  const notificationState = payment.adminNotifications?.settlement || {};
+  const needsEmail = !notificationState.emailSentAt;
+  const needsWhatsApp = !notificationState.whatsappSentAt;
 
-  if (payment.status !== "settlement") {
+  if (!needsEmail && !needsWhatsApp) {
     return;
   }
 
-  if (payment.adminSettlementNotification?.sentAt) {
-    return;
-  }
+  const { updates, results } = await notifyAdminOnSettlement(payment);
 
-  try {
-    const message = buildAdminSettlementMessage(payment, notificationPayload);
-    const notificationResult = await sendAdminSettlementWhatsApp(message);
+  await updateDoc(paymentRef, updates);
 
-    if (notificationResult.skipped) {
-      await updateDoc(paymentRef, {
-        adminSettlementNotification: {
-          sentAt: null,
-          lastAttemptAt: serverTimestamp(),
-          ...notificationResult,
-        },
-        updatedAt: serverTimestamp(),
-      });
-      return;
-    }
-
-    await updateDoc(paymentRef, {
-      adminSettlementNotification: {
-        sentAt: serverTimestamp(),
-        ...notificationResult,
-      },
-      updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    console.error("[whatsapp] failed to notify admin", {
-      orderId,
-      message: error.message,
-      statusCode: error.statusCode || null,
-      responseBody: error.responseBody || null,
-    });
-
-    await updateDoc(paymentRef, {
-      adminSettlementNotification: {
-        sentAt: null,
-        skipped: false,
-        error: error.message,
-        lastAttemptAt: serverTimestamp(),
-      },
-      updatedAt: serverTimestamp(),
-    });
-  }
+  console.info("[payments] settlement admin notifications processed", {
+    orderId,
+    email: results.email,
+    whatsapp: results.whatsapp,
+  });
 }
 
 function createMidtransContext(overrides = {}) {
@@ -537,7 +474,7 @@ router.post("/midtrans/notification", async (req, res) => {
     );
 
     await upsertPaymentStatus(orderId, paymentData);
-    await notifyAdminWhenSettlement(orderId, req.body);
+    await processSettlementAdminNotifications(orderId, paymentData);
 
     return res.status(200).json({
       message: "Midtrans notification processed successfully.",
