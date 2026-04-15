@@ -18,6 +18,7 @@ const {
   getMissingMidtransEnvVars,
   getMidtransDiagnostics,
 } = require("../config/midtrans");
+const { sendAdminSettlementWhatsApp } = require("../services/whatsapp");
 
 const router = express.Router();
 const paymentsCollection = collection(db, "payments");
@@ -81,9 +82,11 @@ function serializePayment(payment) {
     orderId: payment.orderId || null,
     amount: payment.amount ?? null,
     status: payment.status || null,
+    midtransTransactionStatus: payment.midtransTransactionStatus || null,
     paymentType: payment.paymentType || null,
     transactionId: payment.transactionId || null,
     fraudStatus: payment.fraudStatus || null,
+    lastStatusSource: payment.lastStatusSource || null,
     token: payment.token || null,
     redirectUrl: payment.redirectUrl || null,
     userId: payment.userId || null,
@@ -117,8 +120,156 @@ function getTimestampValue(timestamp) {
 
 function sortPaymentsByNewest(payments) {
   return [...payments].sort(
-    (left, right) => getTimestampValue(right.createdAt) - getTimestampValue(left.createdAt)
+    (left, right) =>
+      Math.max(getTimestampValue(right.updatedAt), getTimestampValue(right.createdAt)) -
+      Math.max(getTimestampValue(left.updatedAt), getTimestampValue(left.createdAt))
   );
+}
+
+function normalizeMidtransStatus(transactionStatus, fraudStatus) {
+  if (!transactionStatus) {
+    return null;
+  }
+
+  if (transactionStatus === "capture" && (!fraudStatus || fraudStatus === "accept")) {
+    return "settlement";
+  }
+
+  return transactionStatus;
+}
+
+function buildMidtransPaymentUpdate({
+  orderId,
+  transactionStatus,
+  paymentType,
+  transactionId,
+  fraudStatus,
+  payloadField,
+  payload,
+  source,
+}) {
+  return {
+    orderId,
+    status: normalizeMidtransStatus(transactionStatus, fraudStatus),
+    midtransTransactionStatus: transactionStatus || null,
+    paymentType: paymentType || null,
+    transactionId: transactionId || null,
+    fraudStatus: fraudStatus || null,
+    lastStatusSource: source,
+    [payloadField]: payload,
+    updatedAt: serverTimestamp(),
+  };
+}
+
+function formatCurrency(amount) {
+  if (typeof amount !== "number" || Number.isNaN(amount)) {
+    return null;
+  }
+
+  return new Intl.NumberFormat("id-ID", {
+    style: "currency",
+    currency: "IDR",
+    maximumFractionDigits: 0,
+  }).format(amount);
+}
+
+function buildAdminSettlementMessage(payment = {}, notificationPayload = {}) {
+  const serializedPayment = serializePayment(payment);
+  const grossAmount = Number(notificationPayload.gross_amount || serializedPayment.amount || 0);
+  const paidAt =
+    notificationPayload.settlement_time ||
+    notificationPayload.transaction_time ||
+    serializedPayment.pembeli?.waktu ||
+    "-";
+
+  return [
+    "Pembayaran berhasil diterima.",
+    `Order ID: ${serializedPayment.orderId || "-"}`,
+    `Nama: ${serializedPayment.pembeli?.nama || "-"}`,
+    `Email: ${serializedPayment.email || "-"}`,
+    `Paket: ${serializedPayment.pembeli?.paket || "-"}`,
+    `Jumlah: ${formatCurrency(grossAmount) || "-"}`,
+    `Status: ${serializedPayment.status || notificationPayload.transaction_status || "-"}`,
+    `Metode: ${serializedPayment.paymentType || notificationPayload.payment_type || "-"}`,
+    `Waktu settlement: ${paidAt}`,
+  ].join("\n");
+}
+
+async function upsertPaymentStatus(orderId, paymentData) {
+  const paymentRef = doc(paymentsCollection, orderId);
+  const paymentSnapshot = await getDoc(paymentRef);
+
+  if (paymentSnapshot.exists()) {
+    await updateDoc(paymentRef, paymentData);
+    return;
+  }
+
+  await setDoc(paymentRef, {
+    id: orderId,
+    createdAt: serverTimestamp(),
+    ...paymentData,
+  });
+}
+
+async function notifyAdminWhenSettlement(orderId, notificationPayload) {
+  const paymentRef = doc(paymentsCollection, orderId);
+  const paymentSnapshot = await getDoc(paymentRef);
+
+  if (!paymentSnapshot.exists()) {
+    return;
+  }
+
+  const payment = paymentSnapshot.data();
+
+  if (payment.status !== "settlement") {
+    return;
+  }
+
+  if (payment.adminSettlementNotification?.sentAt) {
+    return;
+  }
+
+  try {
+    const message = buildAdminSettlementMessage(payment, notificationPayload);
+    const notificationResult = await sendAdminSettlementWhatsApp(message);
+
+    if (notificationResult.skipped) {
+      await updateDoc(paymentRef, {
+        adminSettlementNotification: {
+          sentAt: null,
+          lastAttemptAt: serverTimestamp(),
+          ...notificationResult,
+        },
+        updatedAt: serverTimestamp(),
+      });
+      return;
+    }
+
+    await updateDoc(paymentRef, {
+      adminSettlementNotification: {
+        sentAt: serverTimestamp(),
+        ...notificationResult,
+      },
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    console.error("[whatsapp] failed to notify admin", {
+      orderId,
+      message: error.message,
+      statusCode: error.statusCode || null,
+      responseBody: error.responseBody || null,
+    });
+
+    await updateDoc(paymentRef, {
+      adminSettlementNotification: {
+        sentAt: null,
+        skipped: false,
+        error: error.message,
+        lastAttemptAt: serverTimestamp(),
+      },
+      updatedAt: serverTimestamp(),
+    });
+  }
 }
 
 function createMidtransContext(overrides = {}) {
@@ -373,27 +524,20 @@ router.post("/midtrans/notification", async (req, res) => {
       });
     }
 
-    const paymentRef = doc(paymentsCollection, orderId);
-    const paymentSnapshot = await getDoc(paymentRef);
-    const paymentData = {
+    const paymentData = buildMidtransPaymentUpdate({
       orderId,
-      status: transactionStatus,
-      paymentType: paymentType || null,
-      transactionId: transactionId || null,
-      fraudStatus: fraudStatus || null,
-      notificationPayload: req.body,
-      updatedAt: serverTimestamp(),
-    };
-
-    if (paymentSnapshot.exists()) {
-      await updateDoc(paymentRef, paymentData);
-    } else {
-      await setDoc(paymentRef, {
-        id: orderId,
-        ...paymentData,
-        createdAt: serverTimestamp(),
-      });
+      transactionStatus,
+      paymentType,
+      transactionId,
+      fraudStatus,
+      payloadField: "notificationPayload",
+      payload: req.body,
+      source: "midtrans_notification",
     }
+    );
+
+    await upsertPaymentStatus(orderId, paymentData);
+    await notifyAdminWhenSettlement(orderId, req.body);
 
     return res.status(200).json({
       message: "Midtrans notification processed successfully.",
@@ -428,32 +572,24 @@ router.get("/midtrans/status/:orderId", async (req, res) => {
     const midtransStatusUrl = `${midtransConfig.apiBaseUrl}/v2/${orderId}/status`;
 
     const statusResponse = await sendMidtransRequest(midtransStatusUrl, "GET");
-    const paymentRef = doc(paymentsCollection, orderId);
-    const paymentSnapshot = await getDoc(paymentRef);
-    const paymentData = {
+    const paymentData = buildMidtransPaymentUpdate({
       orderId,
-      status: statusResponse.transaction_status || null,
+      transactionStatus: statusResponse.transaction_status || null,
       paymentType: statusResponse.payment_type || null,
       transactionId: statusResponse.transaction_id || null,
       fraudStatus: statusResponse.fraud_status || null,
-      statusPayload: statusResponse,
-      updatedAt: serverTimestamp(),
-    };
+      payloadField: "statusPayload",
+      payload: statusResponse,
+      source: "midtrans_status_api",
+    });
 
-    if (paymentSnapshot.exists()) {
-      await updateDoc(paymentRef, paymentData);
-    } else {
-      await setDoc(paymentRef, {
-        id: orderId,
-        ...paymentData,
-        createdAt: serverTimestamp(),
-      });
-    }
+    await upsertPaymentStatus(orderId, paymentData);
 
     return res.status(200).json({
       message: "Midtrans status fetched successfully.",
       data: {
         ...statusResponse,
+        persistedStatus: paymentData.status,
         diagnostics: createMidtransContext({ orderId }),
       },
     });
